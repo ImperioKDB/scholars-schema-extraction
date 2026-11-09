@@ -1,0 +1,110 @@
+name: Manual production schema-only extraction
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production_ref:
+        description: Type the Scholars production project reference to confirm the source
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scholars-production-schema-extraction
+  cancel-in-progress: false
+
+jobs:
+  extract-schema:
+    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/main' }}
+    name: Extract schema-only snapshot
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate manual confirmation and required secret
+        shell: bash
+        env:
+          CONFIRM_PRODUCTION_REF: ${{ inputs.confirm_production_ref }}
+          EXPECTED_PRODUCTION_REF: cmdglabohpttgfofcmqc
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          if [[ -z "${SUPABASE_DB_URL:-}" ]]; then
+            echo "::error::Required repository secret SUPABASE_DB_URL is missing. No database connection was attempted."
+            exit 1
+          fi
+
+          if [[ "$CONFIRM_PRODUCTION_REF" != "$EXPECTED_PRODUCTION_REF" ]]; then
+            echo "::error::Confirmation did not match the configured production project. No database connection was attempted."
+            exit 1
+          fi
+
+          if [[ "$SUPABASE_DB_URL" != *"$EXPECTED_PRODUCTION_REF"* ]]; then
+            echo "::error::The configured connection string did not identify the expected production project. No database connection was attempted."
+            exit 1
+          fi
+
+      - name: Install pinned Supabase CLI
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # immutable commit pin
+        with:
+          version: 2.122.1
+
+      - name: Verify Supabase CLI version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(supabase --version)"
+          printf 'Installed Supabase CLI %s.\n' "$version"
+          if [[ "$version" != *"2.122.1"* ]]; then
+            echo "::error::The installed Supabase CLI version did not match the pinned release."
+            exit 1
+          fi
+
+      - name: Dump schema only to runner temporary storage
+        shell: bash
+        working-directory: ${{ runner.temp }}
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          output_file="$RUNNER_TEMP/scholars-production-schema-only.sql"
+          log_file="$RUNNER_TEMP/supabase-db-dump.log"
+          trap 'rm -f "$log_file"' EXIT
+          rm -f "$output_file" "$log_file"
+
+          if ! supabase db dump \
+            --db-url "$SUPABASE_DB_URL" \
+            --file scholars-production-schema-only.sql \
+            >"$log_file" 2>&1; then
+            rm -f "$output_file"
+            echo "::error::Schema-only dump failed. CLI output was suppressed to avoid exposing connection details."
+            exit 1
+          fi
+
+          if [[ ! -s "$output_file" ]]; then
+            rm -f "$output_file"
+            echo "::error::Schema-only dump produced no file; no artifact will be uploaded."
+            exit 1
+          fi
+
+      - name: Upload short-lived private workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # immutable commit pin
+        with:
+          name: scholars-production-schema-only-${{ github.run_id }}
+          path: ${{ runner.temp }}/scholars-production-schema-only.sql
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+
+      - name: Remove runner temporary files
+        if: always()
+        shell: bash
+        run: |
+          rm -f \
+            "$RUNNER_TEMP/scholars-production-schema-only.sql" \
+            "$RUNNER_TEMP/supabase-db-dump.log"
