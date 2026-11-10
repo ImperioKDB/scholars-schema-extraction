@@ -161,36 +161,84 @@ import re
 import sys
 
 text = open(sys.argv[1], encoding='utf-8').read()
+visible = []
+i = 0
+line_comment = False
+block_depth = 0
+quote = None
+while i < len(text):
+    if line_comment:
+        if text[i] == "\n":
+            line_comment = False
+            visible.append("\n")
+        else:
+            visible.append(" ")
+        i += 1
+        continue
+    if block_depth:
+        if text.startswith("/*", i):
+            block_depth += 1
+            visible.extend("  ")
+            i += 2
+        elif text.startswith("*/", i):
+            block_depth -= 1
+            visible.extend("  ")
+            i += 2
+        else:
+            visible.append("\n" if text[i] == "\n" else " ")
+            i += 1
+        continue
+    if quote:
+        if quote == "'" and text[i] == "\\" and i + 1 < len(text):
+            visible.extend("  ")
+            i += 2
+        elif text.startswith(quote + quote, i):
+            visible.extend("  ")
+            i += len(quote) * 2
+        elif text.startswith(quote, i):
+            visible.extend(" ")
+            i += len(quote)
+            quote = None
+        else:
+            visible.append("\n" if text[i] == "\n" else " ")
+            i += 1
+        continue
+    if text.startswith("--", i):
+        line_comment = True
+        visible.extend("  ")
+        i += 2
+        continue
+    if text.startswith("/*", i):
+        block_depth = 1
+        visible.extend("  ")
+        i += 2
+        continue
+    if text[i] in ("'", '"'):
+        quote = text[i]
+        visible.append(" ")
+        i += 1
+        continue
+    dollar = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
+    if dollar:
+        tag = dollar.group(0)
+        closing = text.find(tag, i + len(tag))
+        if closing == -1:
+            visible.extend(" " * (len(text) - i))
+            break
+        segment = text[i:closing + len(tag)]
+        visible.extend("\n" if c == "\n" else " " for c in segment)
+        i = closing + len(tag)
+        continue
+    visible.append(text[i])
+    i += 1
 
-# Remove dollar-quoted function/procedure bodies before looking for row data.
-# Literals in a schema definition or function body are not table data.
-without_dollar_bodies = []
-pos = 0
-opening = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
-while True:
-    match = opening.search(text, pos)
-    if match is None:
-        without_dollar_bodies.append(text[pos:])
-        break
-    without_dollar_bodies.append(text[pos:match.start()])
-    tag = match.group(0)
-    closing = text.find(tag, match.end())
-    if closing == -1:
-        without_dollar_bodies.append(text[match.start():])
-        break
-    without_dollar_bodies.append(" ")
-    pos = closing + len(tag)
-clean = "".join(without_dollar_bodies)
-clean = re.sub(r"--[^\n]*", "", clean)
-clean = re.sub(r"/\*.*?\*/", " ", clean, flags=re.S)
-
+clean = "".join(visible)
 actual_data_statement = re.compile(r"(?im)^\s*(?:INSERT\s+INTO|COPY\s+[^\s(]+(?:\s*\([^)]*\))?\s*(?:FROM\s+stdin)?)(?:\s|;|$)")
 fabricated_row_value = re.compile(r"(?i)(?:student@example\.invalid|admin@example\.invalid|synthetic student|synthetic administrator|synthetic scholarship)")
 if actual_data_statement.search(clean) or fabricated_row_value.search(clean):
     raise SystemExit(1)
 PY
 }
-
 scan_data_exclusion() {
   local target="$1"
   local file
@@ -218,10 +266,19 @@ data_scanner_test_dir="$WORK_DIR/data-scanner-tests"
 mkdir -p "$data_scanner_test_dir"
 cat > "$data_scanner_test_dir/definition-literals.sql" <<'EOF'
 CREATE TABLE app.definition_literals (label text DEFAULT 'Synthetic Student');
+CREATE TABLE app.escaped_literals (label text DEFAULT E'Synthetic \'Student\'');
 CREATE FUNCTION app.definition_literal_fn() RETURNS text LANGUAGE sql AS $$
   SELECT 'admin@example.invalid';
 $$;
--- Synthetic Scholarship is a comment, not row data.
+SELECT 'ordinary escaped literal: it\'s Synthetic Scholarship';
+-- INSERT INTO app.students VALUES ('Synthetic Student');
+/* outer comment /* nested INSERT INTO app.students VALUES ('Synthetic Student'); */
+   still a comment with admin@example.invalid */
+EOF
+cat > "$data_scanner_test_dir/dollar-quoted-literals.sql" <<'EOF'
+CREATE FUNCTION app.tagged_literal_fn() RETURNS text LANGUAGE sql AS $body$
+  SELECT 'Synthetic Administrator', 'student@example.invalid';
+$body$;
 EOF
 cat > "$data_scanner_test_dir/insert-row-data.sql" <<'EOF'
 INSERT INTO app.students(display_name, fabricated_email)
@@ -230,10 +287,11 @@ EOF
 cat > "$data_scanner_test_dir/copy-row-data.sql" <<'EOF'
 COPY app.students (display_name, fabricated_email) FROM stdin;
 Synthetic Student	student@example.invalid
-\\.
+\.
 EOF
 : > "$data_scanner_test_dir/empty.sql"
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/definition-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/dollar-quoted-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/insert-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/copy-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/empty.sql")" != 'NOT TESTED' ]]; then data_scanner_tests_status='FAIL'; fi
@@ -354,7 +412,7 @@ This artifact contains sanitized results only. The database was synthetic and te
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
 | pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
-| Data-exclusion scanner fixtures | $data_scanner_tests_status | Definition literals PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
+| Data-exclusion scanner fixtures | $data_scanner_tests_status | Definition, escaped-string, comment, and dollar-quoted literals PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
 | pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Definition-aware output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |

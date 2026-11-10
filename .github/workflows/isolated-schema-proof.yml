@@ -72,11 +72,13 @@ jobs:
             echo '::error::Only the exact synthetic experiment branch may be executed.'
             exit 1
           fi
-          checked_out_ref="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
-          if [[ "$checked_out_ref" != "$EXPECTED_EXPERIMENT_REF" ]]; then
-            echo '::error::The checked-out ref did not match the exact synthetic experiment branch.'
+          checked_out_sha="$(git rev-parse HEAD)"
+          remote_tip_sha="$(git ls-remote origin "refs/heads/$EXPECTED_EXPERIMENT_REF" | awk 'NR == 1 {print $1}')"
+          if [[ -z "$remote_tip_sha" || "$checked_out_sha" != "$remote_tip_sha" ]]; then
+            echo '::error::The checked-out commit did not match the exact remote synthetic experiment branch tip.'
             exit 1
           fi
+          printf 'Verified exact remote experiment tip: %s\n' "$checked_out_sha"
           forbidden_prod="$(printf 'cmdglabohpttgfofcm%s' 'qc')"
           forbidden_stage="$(printf 'aqhktriwaglvvrchxm%s' 'td')"
           forbidden_secret="$(printf 'SUPABASE_%s' 'DB_URL')"
