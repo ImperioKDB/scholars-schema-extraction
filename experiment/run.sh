@@ -154,17 +154,89 @@ record_object_inventory() {
   done < "$WORK_DIR/expected-objects.txt"
 }
 
+scan_data_file() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+
+# Remove dollar-quoted function/procedure bodies before looking for row data.
+# Literals in a schema definition or function body are not table data.
+without_dollar_bodies = []
+pos = 0
+opening = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+while True:
+    match = opening.search(text, pos)
+    if match is None:
+        without_dollar_bodies.append(text[pos:])
+        break
+    without_dollar_bodies.append(text[pos:match.start()])
+    tag = match.group(0)
+    closing = text.find(tag, match.end())
+    if closing == -1:
+        without_dollar_bodies.append(text[match.start():])
+        break
+    without_dollar_bodies.append(" ")
+    pos = closing + len(tag)
+clean = "".join(without_dollar_bodies)
+clean = re.sub(r"--[^\n]*", "", clean)
+clean = re.sub(r"/\*.*?\*/", " ", clean, flags=re.S)
+
+actual_data_statement = re.compile(r"(?im)^\s*(?:INSERT\s+INTO|COPY\s+[^\s(]+(?:\s*\([^)]*\))?\s*(?:FROM\s+stdin)?)(?:\s|;|$)")
+fabricated_row_value = re.compile(r"(?i)(?:student@example\.invalid|admin@example\.invalid|synthetic student|synthetic administrator|synthetic scholarship)")
+if actual_data_statement.search(clean) or fabricated_row_value.search(clean):
+    raise SystemExit(1)
+PY
+}
+
 scan_data_exclusion() {
   local target="$1"
-  local data_pattern='^[[:space:]]*(COPY|INSERT[[:space:]]+INTO)([[:space:]]|$)|student@example[.]invalid|admin@example[.]invalid|Synthetic Student|Synthetic Administrator|Synthetic Scholarship'
+  local file
+  local nonempty_files=0
   if [[ -f "$target" && -s "$target" ]]; then
-    if grep -Eiq "$data_pattern" "$target"; then printf 'FAIL'; else printf 'PASS'; fi
-  elif [[ -d "$target" ]] && find "$target" -type f -size +0c -print -quit | grep -q .; then
-    if grep -RIlEq "$data_pattern" "$target" >/dev/null 2>&1; then printf 'FAIL'; else printf 'PASS'; fi
+    if scan_data_file "$target"; then printf 'PASS'; else printf 'FAIL'; fi
+  elif [[ -d "$target" ]]; then
+    while IFS= read -r -d '' file; do
+      nonempty_files=$((nonempty_files + 1))
+      if ! scan_data_file "$file"; then
+        printf 'FAIL'
+        return
+      fi
+    done < <(find "$target" -type f -size +0c -print0)
+    if [[ "$nonempty_files" -gt 0 ]]; then printf 'PASS'; else printf 'NOT TESTED'; fi
   else
     printf 'NOT TESTED'
   fi
 }
+
+# Positive and negative scanner fixtures run before extraction. Definitions and
+# function-body literals must pass; actual INSERT/COPY row data must fail.
+data_scanner_tests_status='PASS'
+data_scanner_test_dir="$WORK_DIR/data-scanner-tests"
+mkdir -p "$data_scanner_test_dir"
+cat > "$data_scanner_test_dir/definition-literals.sql" <<'EOF'
+CREATE TABLE app.definition_literals (label text DEFAULT 'Synthetic Student');
+CREATE FUNCTION app.definition_literal_fn() RETURNS text LANGUAGE sql AS $$
+  SELECT 'admin@example.invalid';
+$$;
+-- Synthetic Scholarship is a comment, not row data.
+EOF
+cat > "$data_scanner_test_dir/insert-row-data.sql" <<'EOF'
+INSERT INTO app.students(display_name, fabricated_email)
+VALUES ('Synthetic Student', 'student@example.invalid');
+EOF
+cat > "$data_scanner_test_dir/copy-row-data.sql" <<'EOF'
+COPY app.students (display_name, fabricated_email) FROM stdin;
+Synthetic Student	student@example.invalid
+\\.
+EOF
+: > "$data_scanner_test_dir/empty.sql"
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/definition-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/insert-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/copy-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/empty.sql")" != 'NOT TESTED' ]]; then data_scanner_tests_status='FAIL'; fi
 
 pg_dump_output="$WORK_DIR/restricted-schema.sql"
 set +e
@@ -282,11 +354,12 @@ This artifact contains sanitized results only. The database was synthetic and te
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
 | pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
-| pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Output scan |
+| Data-exclusion scanner fixtures | $data_scanner_tests_status | Definition literals PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
+| pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Definition-aware output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |
 | pg-delta diagnostics are empty | $pg_delta_diagnostics_status | stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
-| pg-delta contains no data statements or fabricated values | $pg_delta_data_statements | Output scan |
+| pg-delta contains no data statements or fabricated values | $pg_delta_data_statements | Definition-aware output scan |
 
 Expected object presence is recorded separately for each method. Missing objects remain missing; successful exit does not imply complete extraction.
 
@@ -322,7 +395,7 @@ This experiment distinguishes missing object privileges from RLS. The restricted
 EOF
 
 validation_failed=0
-for status in   "$restricted_connection_status"   "$role_attributes_status"   "$role_memberships_status"   "$effective_grants_status"   "$default_privilege_status"   "$owner_test"   "$rls_status"   "$pg_dump_status"   "$pg_dump_objects_status"   "$pg_dump_diagnostics_status"   "$pg_dump_data_statements"   "$pg_delta_status"   "$pg_delta_objects_status"   "$pg_delta_diagnostics_status"   "$pg_delta_data_statements"; do
+for status in   "$restricted_connection_status"   "$role_attributes_status"   "$role_memberships_status"   "$effective_grants_status"   "$default_privilege_status"   "$owner_test"   "$rls_status"   "$data_scanner_tests_status"   "$pg_dump_status"   "$pg_dump_objects_status"   "$pg_dump_diagnostics_status"   "$pg_dump_data_statements"   "$pg_delta_status"   "$pg_delta_objects_status"   "$pg_delta_diagnostics_status"   "$pg_delta_data_statements"; do
   if [[ "$status" != 'PASS' ]]; then validation_failed=1; fi
 done
 if [[ "$forbidden_total" -ne 9 || "$forbidden_passes" -ne "$forbidden_total" ]]; then
