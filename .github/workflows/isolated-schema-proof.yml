@@ -11,8 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Safest execution path: manually dispatch this workflow from the isolated
+  # experiment branch only. No merge to main or Scholars application repository
+  # is required, and the job has no production/staging inputs or credentials.
   isolated-proof:
-    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/experiment/phase-2-1-8-isolated-proof' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -93,6 +96,7 @@ jobs:
           cat "$RESULT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload short-lived sanitized result
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: isolated-schema-proof-summary-${{ github.run_id }}
