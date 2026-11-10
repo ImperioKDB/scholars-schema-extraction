@@ -3,6 +3,7 @@
 
 CREATE ROLE app_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 CREATE ROLE restricted_extractor LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS PASSWORD :'restricted_password';
+CREATE ROLE rls_probe NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
 
 GRANT CONNECT ON DATABASE synthetic TO restricted_extractor;
 GRANT CREATE ON DATABASE synthetic TO app_owner;
@@ -82,6 +83,10 @@ CREATE POLICY synthetic_student_self_read ON app.students
   FOR SELECT TO restricted_extractor
   USING (false);
 
+CREATE POLICY synthetic_rls_probe_denied ON app.students
+  FOR SELECT TO rls_probe
+  USING (false);
+
 CREATE POLICY synthetic_public_scholarship_read ON app.scholarships
   FOR SELECT TO restricted_extractor
   USING (false);
@@ -92,6 +97,8 @@ CREATE POLICY synthetic_admin_only_audit ON app.audit_events
 
 -- Explicitly grant schema usage but no application-table SELECT/DML to the extractor.
 GRANT USAGE ON SCHEMA app TO restricted_extractor;
+GRANT USAGE ON SCHEMA app TO rls_probe;
+GRANT SELECT ON app.students TO rls_probe;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA app FROM restricted_extractor;
 REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA app FROM restricted_extractor;
 REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA app FROM restricted_extractor;

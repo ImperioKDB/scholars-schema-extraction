@@ -5,7 +5,11 @@ set -euo pipefail
 : "${DB_PORT:?}"
 : "${DB_NAME:?}"
 : "${BOOTSTRAP_USER:?}"
-: "${BOOTSTRAP_PASSWORD:?}"
+BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:-}"
+if [[ -n "$BOOTSTRAP_PASSWORD" ]]; then
+  echo 'BOOTSTRAP_PASSWORD must be empty when the synthetic service uses trust authentication.' >&2
+  exit 1
+fi
 : "${RESTRICTED_USER:?}"
 : "${RESTRICTED_PASSWORD:?}"
 : "${PG_DUMP_BIN:=pg_dump}"
@@ -27,19 +31,29 @@ run_restricted() {
   PGPASSWORD="$RESTRICTED_PASSWORD" psql "$restricted_uri" -v ON_ERROR_STOP=1 "$@"
 }
 
-cat > "$WORK_DIR/role-attributes.txt" <<EOF
-$(run_bootstrap -Atc "SELECT rolname || '|' || rolsuper || '|' || rolcreatedb || '|' || rolcreaterole || '|' || rolbypassrls || '|' || rolinherit FROM pg_roles WHERE rolname IN ('app_owner','restricted_extractor') ORDER BY rolname")
-EOF
-
-cat > "$WORK_DIR/role-memberships.txt" <<EOF
-$(run_bootstrap -Atc "SELECT COALESCE(pg_get_userbyid(roleid),'') || '|' || COALESCE(pg_get_userbyid(member),'') || '|' || admin_option || '|' || inherit_option || '|' || set_option FROM pg_auth_members WHERE member = 'restricted_extractor'::regrole")
-EOF
-
-cat > "$WORK_DIR/effective-grants.txt" <<EOF
-$(run_bootstrap -Atc "SELECT has_schema_privilege('restricted_extractor','app','USAGE') || '|' || has_schema_privilege('restricted_extractor','app','CREATE') || '|' || has_table_privilege('restricted_extractor','app.students','SELECT') || '|' || has_table_privilege('restricted_extractor','app.students','INSERT') || '|' || has_table_privilege('restricted_extractor','app.students','UPDATE') || '|' || has_table_privilege('restricted_extractor','app.students','DELETE')")
-EOF
-
+# The service uses POSTGRES_HOST_AUTH_METHOD=trust, so the bootstrap password is
+# intentionally empty. The restricted role still receives a generated password.
 run_bootstrap -f experiment/schema.sql --set=restricted_password="$RESTRICTED_PASSWORD" >/dev/null
+
+# Inspect role state only after schema.sql has created all roles and objects.
+run_bootstrap -Atc "SELECT rolname || '|' || rolsuper || '|' || rolcreatedb || '|' || rolcreaterole || '|' || rolbypassrls || '|' || rolinherit FROM pg_roles WHERE rolname IN ('app_owner','restricted_extractor','rls_probe') ORDER BY rolname" > "$WORK_DIR/role-attributes.txt"
+run_bootstrap -Atc "SELECT COALESCE(pg_get_userbyid(roleid),'') || '|' || COALESCE(pg_get_userbyid(member),'') || '|' || admin_option || '|' || inherit_option || '|' || set_option FROM pg_auth_members WHERE member IN ('restricted_extractor'::regrole, 'rls_probe'::regrole) ORDER BY member, roleid" > "$WORK_DIR/role-memberships.txt"
+run_bootstrap -Atc "SELECT has_schema_privilege('restricted_extractor','app','USAGE') || '|' || has_schema_privilege('restricted_extractor','app','CREATE') || '|' || has_table_privilege('restricted_extractor','app.students','SELECT') || '|' || has_table_privilege('restricted_extractor','app.students','INSERT') || '|' || has_table_privilege('restricted_extractor','app.students','UPDATE') || '|' || has_table_privilege('restricted_extractor','app.students','DELETE')" > "$WORK_DIR/effective-grants.txt"
+
+# Establish a successful restricted-identity connection before any denial test.
+restricted_connection_status='FAIL'
+restricted_connection_identity=''
+set +e
+restricted_connection_identity="$(run_restricted -Atc "SELECT current_user || '|' || current_database()" 2>"$WORK_DIR/restricted-connection.stderr")"
+restricted_connection_exit=$?
+set -e
+if [[ "$restricted_connection_exit" -eq 0 && "$restricted_connection_identity" == "restricted_extractor|synthetic" ]]; then
+  restricted_connection_status='PASS'
+fi
+if [[ "$restricted_connection_status" != 'PASS' ]]; then
+  echo 'Restricted identity connection could not be established; stopping before denial tests.' >&2
+  exit 1
+fi
 
 owner_test='NOT TESTED'
 if run_bootstrap -Atc "SET ROLE app_owner; CREATE TABLE app.owner_maintenance_check(id integer PRIMARY KEY); DROP TABLE app.owner_maintenance_check;" >/dev/null 2>&1; then
@@ -48,103 +62,206 @@ else
   owner_test='FAIL'
 fi
 
-pg_dump_status='NOT TESTED'
-pg_dump_error=''
+# Demonstrate RLS separately: rls_probe has SELECT privilege, but its false policy
+# must return zero rows. This is not the restricted identity and not a privilege test.
+rls_select_privilege='false'
+rls_visible_rows='NOT TESTED'
+if [[ "$(run_bootstrap -Atc "SELECT has_table_privilege('rls_probe','app.students','SELECT')")" == 't' ]]; then
+  rls_select_privilege='true'
+fi
+set +e
+rls_visible_rows="$(run_bootstrap -Atc "SET ROLE rls_probe; SELECT count(*) FROM app.students" 2>"$WORK_DIR/rls.stderr")"
+rls_exit=$?
+set -e
+rls_status='FAIL'
+if [[ "$rls_select_privilege" == 'true' && "$rls_exit" -eq 0 && "$rls_visible_rows" == '0' ]]; then
+  rls_status='PASS'
+fi
+
+expected_objects=(
+  'app.students'
+  'app.scholarships'
+  'app.scholarship_id_seq'
+  'scholarships_owner_idx'
+  'app.published_scholarships'
+  'app.current_synthetic_admin'
+  'app.audit_events'
+  'app.record_scholarship_insert'
+  'app.scholarships_insert_audit'
+  'synthetic_student_self_read'
+  'synthetic_rls_probe_denied'
+  'synthetic_public_scholarship_read'
+  'synthetic_admin_only_audit'
+)
+printf '%s\n' "${expected_objects[@]}" > "$WORK_DIR/expected-objects.txt"
+
+extract_diagnostic() {
+  local file="$1"
+  if [[ ! -s "$file" ]]; then
+    printf 'none'
+    return
+  fi
+  # Keep only diagnostic words; never emit connection strings or raw output.
+  tr '\n' ' ' < "$file" | sed -E 's/[[:space:]]+/ /g; s/[^[:alnum:]_.: -]//g' | cut -c1-400
+}
+
+record_object_inventory() {
+  local label="$1"
+  local target="$2"
+  local name
+  : > "$RESULT_DIR/${label}-objects.tsv"
+  while IFS= read -r name; do
+    if [[ -f "$target" ]]; then
+      if grep -Eq "${name//./\\.}" "$target"; then
+        printf '%s|present\n' "$name" >> "$RESULT_DIR/${label}-objects.tsv"
+      else
+        printf '%s|missing\n' "$name" >> "$RESULT_DIR/${label}-objects.tsv"
+      fi
+    elif [[ -d "$target" ]]; then
+      if grep -RIlEq "${name//./\\.}" "$target" >/dev/null 2>&1; then
+        printf '%s|present\n' "$name" >> "$RESULT_DIR/${label}-objects.tsv"
+      else
+        printf '%s|missing\n' "$name" >> "$RESULT_DIR/${label}-objects.tsv"
+      fi
+    else
+      printf '%s|missing\n' "$name" >> "$RESULT_DIR/${label}-objects.tsv"
+    fi
+  done < "$WORK_DIR/expected-objects.txt"
+}
+
 pg_dump_output="$WORK_DIR/restricted-schema.sql"
 set +e
 PGPASSWORD="$RESTRICTED_PASSWORD" "$PG_DUMP_BIN" --schema-only --schema=app --file="$pg_dump_output" "$restricted_uri" >"$WORK_DIR/pg_dump.stdout" 2>"$WORK_DIR/pg_dump.stderr"
 pg_dump_exit=$?
 set -e
-if [[ "$pg_dump_exit" -eq 0 ]]; then pg_dump_status='PASS'; else pg_dump_status='FAIL'; fi
-if [[ -s "$WORK_DIR/pg_dump.stderr" ]]; then pg_dump_error='yes'; else pg_dump_error='no'; fi
-pg_dump_objects='0'
-if [[ -s "$pg_dump_output" ]]; then pg_dump_objects="$(grep -Ec '^(CREATE|ALTER|COMMENT ON|GRANT|REVOKE)' "$pg_dump_output" || true)"; fi
-pg_dump_records='FAIL'
-if [[ -s "$pg_dump_output" ]] && ! grep -Eq 'student@example\.invalid|admin@example\.invalid|Synthetic Scholarship' "$pg_dump_output"; then pg_dump_records='PASS'; fi
+pg_dump_status='FAIL'
+if [[ "$pg_dump_exit" -eq 0 ]]; then pg_dump_status='PASS'; fi
+pg_dump_diagnostic="$(extract_diagnostic "$WORK_DIR/pg_dump.stderr")"
+pg_dump_object_count='0'
+if [[ -s "$pg_dump_output" ]]; then pg_dump_object_count="$(grep -Ec '^(CREATE|ALTER|COMMENT ON|GRANT|REVOKE)' "$pg_dump_output" || true)"; fi
+pg_dump_data_statements='PASS'
+if [[ -s "$pg_dump_output" ]] && grep -Eiq '^(COPY|INSERT INTO)|student@example\.invalid|admin@example\.invalid|Synthetic Scholarship' "$pg_dump_output"; then
+  pg_dump_data_statements='FAIL'
+fi
+record_object_inventory 'pg-dump' "$pg_dump_output"
 
-pg_delta_status='NOT TESTED'
-pg_delta_error=''
-declarative_dir="$WORK_DIR/declarative"
+pg_delta_output="$WORK_DIR/declarative"
 set +e
 "$SUPABASE_BIN" db schema declarative generate \
   --db-url "$restricted_uri" \
   --schema app \
-  --output-dir "$declarative_dir" \
+  --output-dir "$pg_delta_output" \
   --strict-coverage --experimental \
   >"$WORK_DIR/pg_delta.stdout" 2>"$WORK_DIR/pg_delta.stderr"
 pg_delta_exit=$?
 set -e
-if [[ "$pg_delta_exit" -eq 0 ]]; then pg_delta_status='PASS'; else pg_delta_status='FAIL'; fi
-if [[ -s "$WORK_DIR/pg_delta.stderr" ]]; then pg_delta_error='yes'; else pg_delta_error='no'; fi
-pg_delta_objects='0'
-if [[ -d "$declarative_dir" ]]; then pg_delta_objects="$(find "$declarative_dir" -type f | wc -l | tr -d ' ')"; fi
+pg_delta_status='FAIL'
+if [[ "$pg_delta_exit" -eq 0 ]]; then pg_delta_status='PASS'; fi
+pg_delta_diagnostic="$(extract_diagnostic "$WORK_DIR/pg_delta.stderr")"
+pg_delta_object_count='0'
+if [[ -d "$pg_delta_output" ]]; then pg_delta_object_count="$(find "$pg_delta_output" -type f | wc -l | tr -d ' ')"; fi
+pg_delta_data_statements='PASS'
+if [[ -d "$pg_delta_output" ]] && grep -RIlEq '^(COPY|INSERT INTO)|student@example\.invalid|admin@example\.invalid|Synthetic Scholarship' "$pg_delta_output" >/dev/null 2>&1; then
+  pg_delta_data_statements='FAIL'
+fi
+record_object_inventory 'pg-delta' "$pg_delta_output"
 
+# Each denial test has its own SQLSTATE assertion. Connection failures, syntax
+# errors, and missing-object errors are failures, never passes.
 run_forbidden() {
   local label="$1"
   local sql="$2"
+  local expected_sqlstate="$3"
+  local key
+  key="$(printf '%s' "$label" | tr '[:upper:] ' '[:lower:]_')"
+  local stderr_file="$WORK_DIR/forbidden-${key}.stderr"
+  local stdout_file="$WORK_DIR/forbidden-${key}.stdout"
+  local observed_sqlstate='none'
   local result='FAIL'
+  local reason='command_or_connection_failure'
   set +e
-  run_restricted -Atc "$sql" >/dev/null 2>&1
+  run_restricted -v VERBOSITY=verbose -Atc "$sql" >"$stdout_file" 2>"$stderr_file"
   local exit_code=$?
   set -e
-  if [[ "$exit_code" -ne 0 ]]; then result='PASS'; fi
-  printf '%s|%s\n' "$label" "$result" >> "$RESULT_DIR/forbidden-results.txt"
+  observed_sqlstate="$(grep -Eo 'ERROR:[[:space:]]+[0-9A-Z]{5}:' "$stderr_file" | head -n1 | grep -Eo '[0-9A-Z]{5}' || true)"
+  if [[ "$exit_code" -eq 0 ]]; then
+    reason='unexpected_success'
+  elif [[ "$observed_sqlstate" == '42P01' || "$observed_sqlstate" == '42601' ]]; then
+    reason='missing_object_or_syntax_error'
+  elif [[ "$observed_sqlstate" == "$expected_sqlstate" ]]; then
+    result='PASS'
+    reason='expected_privilege_denial'
+  else
+    reason='unexpected_sqlstate_or_connection_failure'
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$label" "$result" "$expected_sqlstate" "${observed_sqlstate:-none}" "$exit_code" "$reason" >> "$RESULT_DIR/forbidden-results.tsv"
 }
 
-: > "$RESULT_DIR/forbidden-results.txt"
-run_forbidden 'SELECT synthetic application records' "SELECT display_name FROM app.students LIMIT 1"
-run_forbidden 'INSERT application records' "INSERT INTO app.students(display_name, fabricated_email) VALUES ('forbidden','forbidden@example.invalid')"
-run_forbidden 'UPDATE application records' "UPDATE app.students SET display_name='forbidden' WHERE id=1"
-run_forbidden 'DELETE application records' "DELETE FROM app.students WHERE id=1"
-run_forbidden 'CREATE TABLE' "CREATE TABLE app.forbidden_table(id integer)"
-run_forbidden 'ALTER TABLE' "ALTER TABLE app.students ADD COLUMN forbidden integer"
-run_forbidden 'CREATE FUNCTION' "CREATE FUNCTION app.forbidden_function() RETURNS integer LANGUAGE sql AS 'SELECT 1'"
-run_forbidden 'Change privileges' "GRANT SELECT ON app.students TO restricted_extractor"
-run_forbidden 'Assume elevated role' "SET ROLE app_owner"
+: > "$RESULT_DIR/forbidden-results.tsv"
+run_forbidden 'SELECT synthetic application records' "SELECT display_name FROM app.students LIMIT 1" '42501'
+run_forbidden 'INSERT application records' "INSERT INTO app.students(display_name, fabricated_email) VALUES ('forbidden','forbidden@example.invalid')" '42501'
+run_forbidden 'UPDATE application records' "UPDATE app.students SET display_name='forbidden' WHERE id=1" '42501'
+run_forbidden 'DELETE application records' "DELETE FROM app.students WHERE id=1" '42501'
+run_forbidden 'CREATE TABLE' "CREATE TABLE app.forbidden_table(id integer)" '42501'
+run_forbidden 'ALTER TABLE' "ALTER TABLE app.students ADD COLUMN forbidden integer" '42501'
+run_forbidden 'CREATE FUNCTION' "CREATE FUNCTION app.forbidden_function() RETURNS integer LANGUAGE sql AS 'SELECT 1'" '42501'
+run_forbidden 'Change privileges' "GRANT SELECT ON app.students TO restricted_extractor" '42501'
+run_forbidden 'Assume elevated role' "SET ROLE app_owner" '42501'
 
-forbidden_passes="$(awk -F'|' '$2 == "PASS" {count++} END {print count+0}' "$RESULT_DIR/forbidden-results.txt")"
-forbidden_total="$(wc -l < "$RESULT_DIR/forbidden-results.txt" | tr -d ' ')"
+forbidden_passes="$(awk -F'\t' '$2 == "PASS" {count++} END {print count+0}' "$RESULT_DIR/forbidden-results.tsv")"
+forbidden_total="$(wc -l < "$RESULT_DIR/forbidden-results.tsv" | tr -d ' ')"
 
 cat > "$RESULT_DIR/summary.md" <<EOF
-# Phase 2.1.8 Synthetic Extraction Experiment Results
+# Phase 2.1.8.1 Synthetic Extraction Correction Results
 
 This artifact contains sanitized results only. The database was synthetic and temporary. No Supabase project, production/staging URL, or repository secret was used.
 
-## Tooling
+## Connection and RLS separation
 
-- PostgreSQL service: synthetic `postgres:16.4-bookworm` service container.
-- `pg_dump`: captured at runtime by the workflow.
-- Supabase CLI: pinned `2.122.1`.
-- Database URL: local service only; not retained.
+| Check | Result | Evidence |
+|---|---|---|
+| Restricted identity connection | $restricted_connection_status | Identity/database: restricted_extractor/synthetic; exit: $restricted_connection_exit |
+| RLS probe has SELECT privilege | $rls_select_privilege | Checked independently for rls_probe |
+| RLS probe sees protected rows | $rls_status | rls_probe SELECT exit: $rls_exit; visible rows: $rls_visible_rows |
+| Separate owner maintenance operation | $owner_test | Synthetic owner-only create/drop test |
 
-## Restricted identity
-
-- Role: `restricted_extractor`.
-- Attributes: `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`, `NOBYPASSRLS`.
-- Application-table SELECT/DML/DDL privileges: none by design.
-- Privileged memberships: none observed.
-- Effective grant record: role attributes and grant checks are retained only in the workflow workspace and are not uploaded.
-
-## Results
+## Extraction validation
 
 | Capability | Result | Evidence |
 |---|---|---|
-| pg_dump schema-only extraction | $pg_dump_status | Exit code $pg_dump_exit; definition statements counted: $pg_dump_objects; stderr present: $pg_dump_error |
-| pg_dump contains no synthetic records | $pg_dump_records | Output scan |
-| pg-delta declarative generation | $pg_delta_status | Exit code $pg_delta_exit; files observed: $pg_delta_objects; stderr present: $pg_delta_error |
-| Restricted identity forbidden-operation tests | $([[ "$forbidden_passes" == "$forbidden_total" ]] && echo PASS || echo FAIL) | $forbidden_passes/$forbidden_total failed as required |
-| Separate owner maintenance operation | $owner_test | Synthetic owner-only create/drop test |
+| pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; diagnostic: $pg_dump_diagnostic |
+| pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Output scan |
+| pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; diagnostic: $pg_delta_diagnostic |
+| pg-delta contains no data statements or fabricated values | $pg_delta_data_statements | Output scan |
 
-## Forbidden-operation results
+Expected object presence is recorded separately for each method. Missing objects remain missing; successful exit does not imply complete extraction.
 
-| Operation | Result |
+### pg_dump expected-object inventory
+
+| Object | Status |
 |---|---|
-$(awk -F'|' '{printf "| %s | %s |\n", $1, $2}' "$RESULT_DIR/forbidden-results.txt")
+$(awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}' "$RESULT_DIR/pg-dump-objects.tsv")
+
+### pg-delta expected-object inventory
+
+| Object | Status |
+|---|---|
+$(awk -F'|' '{printf "| `%s` | %s |\n", $1, $2}' "$RESULT_DIR/pg-delta-objects.tsv")
+
+## Restricted forbidden-operation tests
+
+Each row was run after a successful restricted-identity connection. A PASS requires the expected privilege-denial SQLSTATE `42501`; connection failures, syntax errors, missing-object errors, unexpected success, and other SQLSTATEs are failures.
+
+| Operation | Result | Expected SQLSTATE | Observed SQLSTATE | Exit | Classification |
+|---|---|---:|---:|---:|---|
+$(awk -F'\t' '{printf "| %s | %s | `%s` | `%s` | %s | %s |\n", $1, $2, $3, ($4 == "" ? "none" : $4), $5, $6}' "$RESULT_DIR/forbidden-results.tsv")
+
+**Forbidden-operation aggregate:** $forbidden_passes/$forbidden_total passed the explicit denial assertion.
 
 ## Interpretation
 
-A successful extraction command is not treated as proof of complete coverage. Review the actual exit codes, warnings, unsupported objects, missing objects, and generated definitions before classifying a method as suitable for future restricted extraction. No privilege was increased to force success.
+This experiment distinguishes missing object privileges from RLS. The restricted role has no application-table SELECT, so its SELECT failure is a privilege test. The separate `rls_probe` role has SELECT privilege but is denied all rows by an RLS policy, demonstrating RLS independently. Review warnings, SQLSTATEs, expected-object inventories, and omitted/unsupported objects before classifying a method as suitable for future restricted extraction.
 EOF
 
-# Keep only the sanitized report for the short-lived workflow artifact.
-rm -rf "$WORK_DIR" "$RESULT_DIR/forbidden-results.txt"
+# Keep only the sanitized report and inventories for the short-lived artifact.
+rm -rf "$WORK_DIR" "$RESULT_DIR/forbidden-results.tsv"
