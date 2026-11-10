@@ -2,6 +2,12 @@ name: Isolated restricted schema extraction proof
 
 on:
   workflow_dispatch:
+    inputs:
+      experiment_ref:
+        description: Exact synthetic experiment branch to execute
+        required: true
+        default: experiment/phase-2-1-8-isolated-proof
+        type: string
 
 permissions:
   contents: read
@@ -10,12 +16,15 @@ concurrency:
   group: isolated-restricted-schema-proof
   cancel-in-progress: true
 
+env:
+  EXPECTED_EXPERIMENT_REF: experiment/phase-2-1-8-isolated-proof
+  SYNTHETIC_BOOTSTRAP_PASSWORD: synthetic-bootstrap-password-phase-2-1-8-3
+
 jobs:
-  # Safest execution path: manually dispatch this workflow from the isolated
-  # experiment branch only. No merge to main or Scholars application repository
-  # is required, and the job has no production/staging inputs or credentials.
   isolated-proof:
-    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/experiment/phase-2-1-8-isolated-proof' }}
+    # This workflow file must be present on the default branch for manual
+    # dispatch. It then checks out only the exact isolated experiment branch.
+    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/main' && inputs.experiment_ref == 'experiment/phase-2-1-8-isolated-proof' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -23,8 +32,8 @@ jobs:
         image: postgres:16.4-bookworm
         env:
           POSTGRES_USER: bootstrap
+          POSTGRES_PASSWORD: synthetic-bootstrap-password-phase-2-1-8-3
           POSTGRES_DB: synthetic
-          POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
         options: >-
@@ -33,8 +42,11 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     steps:
-      - name: Check out synthetic experiment only
+      - name: Check out exact synthetic experiment branch
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.experiment_ref }}
+          fetch-depth: 1
 
       - name: Install pinned PostgreSQL client
         shell: bash
@@ -52,15 +64,25 @@ jobs:
 
       - name: Verify isolated-only workflow inputs
         shell: bash
+        env:
+          DISPATCHED_REF: ${{ inputs.experiment_ref }}
         run: |
           set -euo pipefail
+          if [[ "$DISPATCHED_REF" != "$EXPECTED_EXPERIMENT_REF" ]]; then
+            echo '::error::Only the exact synthetic experiment branch may be executed.'
+            exit 1
+          fi
+          checked_out_ref="$(git symbolic-ref --short HEAD 2>/dev/null || true)"
+          if [[ "$checked_out_ref" != "$EXPECTED_EXPERIMENT_REF" ]]; then
+            echo '::error::The checked-out ref did not match the exact synthetic experiment branch.'
+            exit 1
+          fi
           forbidden_prod="$(printf 'cmdglabohpttgfofcm%s' 'qc')"
           forbidden_stage="$(printf 'aqhktriwaglvvrchxm%s' 'td')"
           forbidden_secret="$(printf 'SUPABASE_%s' 'DB_URL')"
           forbidden_supabase="$(printf 'supabase%s' '.co')"
           forbidden_vercel="$(printf 'vercel%s' '.app')"
-          if grep -RInE "$forbidden_prod|$forbidden_stage|$forbidden_secret|$forbidden_supabase|$forbidden_vercel" \
-            .github/workflows/isolated-schema-proof.yml experiment/schema.sql experiment/run.sh; then
+          if grep -RInE "$forbidden_prod|$forbidden_stage|$forbidden_secret|$forbidden_supabase|$forbidden_vercel"             .github/workflows/isolated-schema-proof.yml experiment/schema.sql experiment/run.sh; then
             echo '::error::A production/staging reference was found in the synthetic experiment files.'
             exit 1
           fi
@@ -68,6 +90,8 @@ jobs:
 
       - name: Create temporary synthetic credentials
         shell: bash
+        env:
+          BOOTSTRAP_PASSWORD: ${{ env.SYNTHETIC_BOOTSTRAP_PASSWORD }}
         run: |
           set -euo pipefail
           restricted_password="$(openssl rand -hex 32)"
@@ -76,7 +100,7 @@ jobs:
             echo "DB_PORT=5432"
             echo "DB_NAME=synthetic"
             echo "BOOTSTRAP_USER=bootstrap"
-            echo "BOOTSTRAP_PASSWORD="
+            echo "BOOTSTRAP_PASSWORD=$BOOTSTRAP_PASSWORD"
             echo "RESTRICTED_USER=restricted_extractor"
             echo "RESTRICTED_PASSWORD=$restricted_password"
             echo "RESULT_DIR=$RUNNER_TEMP/phase-2-1-8-results"

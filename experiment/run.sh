@@ -5,11 +5,7 @@ set -euo pipefail
 : "${DB_PORT:?}"
 : "${DB_NAME:?}"
 : "${BOOTSTRAP_USER:?}"
-BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:-}"
-if [[ -n "$BOOTSTRAP_PASSWORD" ]]; then
-  echo 'BOOTSTRAP_PASSWORD must be empty when the synthetic service uses trust authentication.' >&2
-  exit 1
-fi
+BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:?}"
 : "${RESTRICTED_USER:?}"
 : "${RESTRICTED_PASSWORD:?}"
 : "${PG_DUMP_BIN:=pg_dump}"
@@ -31,8 +27,12 @@ run_restricted() {
   PGPASSWORD="$RESTRICTED_PASSWORD" psql "$restricted_uri" -v ON_ERROR_STOP=1 "$@"
 }
 
-# The service uses POSTGRES_HOST_AUTH_METHOD=trust, so the bootstrap password is
-# intentionally empty. The restricted role still receives a generated password.
+# Both connections use password authentication against the disposable service.
+bootstrap_identity="$(run_bootstrap -Atc "SELECT current_user || '|' || current_database()")"
+if [[ "$bootstrap_identity" != "${BOOTSTRAP_USER}|${DB_NAME}" ]]; then
+  echo 'Bootstrap password authentication identity did not match the synthetic service.' >&2
+  exit 1
+fi
 run_bootstrap -f experiment/schema.sql --set=restricted_password="$RESTRICTED_PASSWORD" >/dev/null
 
 # Inspect and assert role state only after schema.sql has created all roles and objects.
@@ -179,6 +179,11 @@ pg_dump_object_count='0'
 if [[ -s "$pg_dump_output" ]]; then pg_dump_object_count="$(grep -Ec '^[[:space:]]*CREATE[[:space:]]+(TABLE|SEQUENCE|INDEX|VIEW|FUNCTION|TRIGGER|POLICY)' "$pg_dump_output" || true)"; fi
 pg_dump_data_statements="$(scan_data_exclusion "$pg_dump_output")"
 record_object_inventory 'pg-dump' "$pg_dump_output"
+pg_dump_missing_objects="$(awk -F'|' '$3 == "missing" {count++} END {print count+0}' "$RESULT_DIR/pg-dump-objects.tsv")"
+pg_dump_objects_status='FAIL'
+if [[ "$pg_dump_exit" -eq 0 && -s "$pg_dump_output" && "$pg_dump_missing_objects" -eq 0 ]]; then pg_dump_objects_status='PASS'; fi
+pg_dump_diagnostics_status='PASS'
+if [[ -s "$WORK_DIR/pg_dump.stdout" || -s "$WORK_DIR/pg_dump.stderr" ]]; then pg_dump_diagnostics_status='FAIL'; fi
 
 pg_delta_output="$WORK_DIR/declarative"
 set +e
@@ -200,6 +205,11 @@ pg_delta_object_count='0'
 if [[ -d "$pg_delta_output" ]]; then pg_delta_object_count="$(find "$pg_delta_output" -type f | wc -l | tr -d ' ')"; fi
 pg_delta_data_statements="$(scan_data_exclusion "$pg_delta_output")"
 record_object_inventory 'pg-delta' "$pg_delta_output"
+pg_delta_missing_objects="$(awk -F'|' '$3 == "missing" {count++} END {print count+0}' "$RESULT_DIR/pg-delta-objects.tsv")"
+pg_delta_objects_status='FAIL'
+if [[ "$pg_delta_exit" -eq 0 && "$pg_delta_nonempty_files" -gt 0 && "$pg_delta_missing_objects" -eq 0 ]]; then pg_delta_objects_status='PASS'; fi
+pg_delta_diagnostics_status='PASS'
+if [[ -s "$WORK_DIR/pg_delta.stdout" || -s "$WORK_DIR/pg_delta.stderr" ]]; then pg_delta_diagnostics_status='FAIL'; fi
 
 # Each denial test has its own SQLSTATE assertion. Connection failures, syntax
 # errors, and missing-object errors are failures, never passes.
@@ -255,6 +265,7 @@ This artifact contains sanitized results only. The database was synthetic and te
 
 | Check | Result | Evidence |
 |---|---|---|
+| Bootstrap password authentication | PASS | Identity/database: $bootstrap_identity |
 | Restricted identity connection | $restricted_connection_status | Identity/database: restricted_extractor/synthetic; exit: $restricted_connection_exit |
 | RLS probe has SELECT privilege | $rls_select_privilege | Checked independently for rls_probe |
 | RLS probe sees protected rows | $rls_status | rls_probe SELECT exit: $rls_exit; visible rows: $rls_visible_rows |
@@ -269,8 +280,12 @@ This artifact contains sanitized results only. The database was synthetic and te
 | Capability | Result | Evidence |
 |---|---|---|
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
+| pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
+| pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
+| pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |
+| pg-delta diagnostics are empty | $pg_delta_diagnostics_status | stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta contains no data statements or fabricated values | $pg_delta_data_statements | Output scan |
 
 Expected object presence is recorded separately for each method. Missing objects remain missing; successful exit does not imply complete extraction.
@@ -297,15 +312,22 @@ $(awk -F'\t' '{printf "| %s | %s | `%s` | `%s` | %s | %s |\n", $1, $2, $3, ($4 =
 
 **Forbidden-operation aggregate:** $forbidden_passes/$forbidden_total passed the explicit denial assertion.
 
+## Mandatory fail-closed gate
+
+The runner exits unsuccessfully unless bootstrap and restricted authentication, role attributes, memberships, effective privileges, default privileges, separate RLS, owner maintenance, both extraction commands, non-empty outputs, complete object inventories, empty diagnostics, PASS data-exclusion checks, and all forbidden-operation SQLSTATE assertions pass.
+
 ## Interpretation
 
 This experiment distinguishes missing object privileges from RLS. The restricted role has no application-table SELECT, so its SELECT failure is a privilege test. The separate `rls_probe` role has SELECT privilege but is denied all rows by an RLS policy, demonstrating RLS independently. Review warnings, SQLSTATEs, expected-object inventories, and omitted/unsupported objects before classifying a method as suitable for future restricted extraction.
 EOF
 
 validation_failed=0
-for status in "$role_attributes_status" "$role_memberships_status" "$effective_grants_status" "$default_privilege_status"; do
+for status in   "$restricted_connection_status"   "$role_attributes_status"   "$role_memberships_status"   "$effective_grants_status"   "$default_privilege_status"   "$owner_test"   "$rls_status"   "$pg_dump_status"   "$pg_dump_objects_status"   "$pg_dump_diagnostics_status"   "$pg_dump_data_statements"   "$pg_delta_status"   "$pg_delta_objects_status"   "$pg_delta_diagnostics_status"   "$pg_delta_data_statements"; do
   if [[ "$status" != 'PASS' ]]; then validation_failed=1; fi
 done
+if [[ "$forbidden_total" -ne 9 || "$forbidden_passes" -ne "$forbidden_total" ]]; then
+  validation_failed=1
+fi
 
 # Keep only the sanitized report and inventories for the short-lived artifact.
 rm -rf "$WORK_DIR" "$RESULT_DIR/forbidden-results.tsv"
