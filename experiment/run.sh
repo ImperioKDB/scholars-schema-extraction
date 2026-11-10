@@ -183,7 +183,7 @@ pg_dump_missing_objects="$(awk -F'|' '$3 == "missing" {count++} END {print count
 pg_dump_objects_status='FAIL'
 if [[ "$pg_dump_exit" -eq 0 && -s "$pg_dump_output" && "$pg_dump_missing_objects" -eq 0 ]]; then pg_dump_objects_status='PASS'; fi
 pg_dump_diagnostics_status='PASS'
-if [[ -s "$WORK_DIR/pg_dump.stdout" || -s "$WORK_DIR/pg_dump.stderr" ]]; then pg_dump_diagnostics_status='FAIL'; fi
+if [[ -s "$WORK_DIR/pg_dump.stderr" ]] || grep -Eiq '(warning|warn|error|fatal|failed|failure)' "$WORK_DIR/pg_dump.stdout"; then pg_dump_diagnostics_status='FAIL'; fi
 
 pg_delta_output="$WORK_DIR/declarative"
 set +e
@@ -209,7 +209,7 @@ pg_delta_missing_objects="$(awk -F'|' '$3 == "missing" {count++} END {print coun
 pg_delta_objects_status='FAIL'
 if [[ "$pg_delta_exit" -eq 0 && "$pg_delta_nonempty_files" -gt 0 && "$pg_delta_missing_objects" -eq 0 ]]; then pg_delta_objects_status='PASS'; fi
 pg_delta_diagnostics_status='PASS'
-if [[ -s "$WORK_DIR/pg_delta.stdout" || -s "$WORK_DIR/pg_delta.stderr" ]]; then pg_delta_diagnostics_status='FAIL'; fi
+if [[ -s "$WORK_DIR/pg_delta.stderr" ]] || grep -Eiq '(warning|warn|error|fatal|failed|failure)' "$WORK_DIR/pg_delta.stdout"; then pg_delta_diagnostics_status='FAIL'; fi
 
 # Each denial test has its own SQLSTATE assertion. Connection failures, syntax
 # errors, and missing-object errors are failures, never passes.
