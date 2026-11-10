@@ -1,0 +1,107 @@
+name: Isolated restricted schema extraction proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-restricted-schema-proof
+  cancel-in-progress: true
+
+jobs:
+  isolated-proof:
+    if: ${{ github.repository == 'ImperioKDB/scholars-schema-extraction' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16.4-bookworm
+        env:
+          POSTGRES_USER: bootstrap
+          POSTGRES_DB: synthetic
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bootstrap -d synthetic"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Check out synthetic experiment only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned PostgreSQL client
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends postgresql-client-16
+          pg_dump --version
+          psql --version
+
+      - name: Install pinned Supabase CLI
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v2.122.1 setup action
+        with:
+          version: 2.122.1
+
+      - name: Verify isolated-only workflow inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          forbidden_prod="$(printf 'cmdglabohpttgfofcm%s' 'qc')"
+          forbidden_stage="$(printf 'aqhktriwaglvvrchxm%s' 'td')"
+          forbidden_secret="$(printf 'SUPABASE_%s' 'DB_URL')"
+          forbidden_supabase="$(printf 'supabase%s' '.co')"
+          forbidden_vercel="$(printf 'vercel%s' '.app')"
+          if grep -RInE "$forbidden_prod|$forbidden_stage|$forbidden_secret|$forbidden_supabase|$forbidden_vercel" \
+            .github/workflows/isolated-schema-proof.yml experiment/schema.sql experiment/run.sh; then
+            echo '::error::A production/staging reference was found in the synthetic experiment files.'
+            exit 1
+          fi
+          supabase --version
+
+      - name: Create temporary synthetic credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          restricted_password="$(openssl rand -hex 32)"
+          {
+            echo "DB_HOST=127.0.0.1"
+            echo "DB_PORT=5432"
+            echo "DB_NAME=synthetic"
+            echo "BOOTSTRAP_USER=bootstrap"
+            echo "BOOTSTRAP_PASSWORD="
+            echo "RESTRICTED_USER=restricted_extractor"
+            echo "RESTRICTED_PASSWORD=$restricted_password"
+            echo "RESULT_DIR=$RUNNER_TEMP/phase-2-1-8-results"
+            echo "WORK_DIR=$RUNNER_TEMP/phase-2-1-8-work"
+          } >> "$GITHUB_ENV"
+
+      - name: Run synthetic restricted extraction experiment
+        shell: bash
+        env:
+          RESULT_DIR: ${{ runner.temp }}/phase-2-1-8-results
+          WORK_DIR: ${{ runner.temp }}/phase-2-1-8-work
+        run: |
+          set -euo pipefail
+          chmod 700 experiment/run.sh
+          ./experiment/run.sh
+          test -s "$RESULT_DIR/summary.md"
+          cat "$RESULT_DIR/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload short-lived sanitized result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: isolated-schema-proof-summary-${{ github.run_id }}
+          path: ${{ runner.temp }}/phase-2-1-8-results/summary.md
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove temporary credentials and results
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/phase-2-1-8-results" "$RUNNER_TEMP/phase-2-1-8-work"
