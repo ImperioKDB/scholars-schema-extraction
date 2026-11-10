@@ -10,6 +10,7 @@ BOOTSTRAP_PASSWORD="${BOOTSTRAP_PASSWORD:?}"
 : "${RESTRICTED_PASSWORD:?}"
 : "${PG_DUMP_BIN:=pg_dump}"
 : "${SUPABASE_BIN:=supabase}"
+SCANNER_STANDARD_CONFORMING_STRINGS="${SCANNER_STANDARD_CONFORMING_STRINGS:-on}"
 
 RESULT_DIR="${RESULT_DIR:-$RUNNER_TEMP/phase-2-1-8-results}"
 WORK_DIR="${WORK_DIR:-$RUNNER_TEMP/phase-2-1-8-work}"
@@ -156,16 +157,37 @@ record_object_inventory() {
 
 scan_data_file() {
   local file="$1"
-  python3 - "$file" <<'PY'
+  SCANNER_STANDARD_CONFORMING_STRINGS="$SCANNER_STANDARD_CONFORMING_STRINGS" python3 - "$file" <<'PY'
+import os
 import re
 import sys
 
 text = open(sys.argv[1], encoding='utf-8').read()
+configured_setting = os.environ.get("SCANNER_STANDARD_CONFORMING_STRINGS", "")
+if configured_setting not in {"on", "off"}:
+    raise SystemExit("unsupported or undetermined standard_conforming_strings setting")
+
+# An explicit setting must be simple, unambiguous, and agree with the
+# synthetic experiment's configured PostgreSQL setting. Ambiguous or unknown
+# settings fail closed instead of silently choosing a string-escape mode.
+setting_mentions = re.findall(r"(?i)standard_conforming_strings", text)
+explicit_settings = re.findall(
+    r"(?is)\bSET\s+standard_conforming_strings\s*(?:TO|=)\s*(on|off)\s*;?",
+    text,
+)
+if setting_mentions:
+    if len(explicit_settings) != len(setting_mentions) or len(set(x.lower() for x in explicit_settings)) != 1:
+        raise SystemExit("unsupported or ambiguous standard_conforming_strings setting")
+    if explicit_settings[0].lower() != configured_setting:
+        raise SystemExit("standard_conforming_strings disagrees with configured setting")
+standard_conforming_strings = configured_setting == "on"
+
 visible = []
 i = 0
 line_comment = False
 block_depth = 0
 quote = None
+quote_escapes_backslash = False
 while i < len(text):
     if line_comment:
         if text[i] == "\n":
@@ -189,16 +211,17 @@ while i < len(text):
             i += 1
         continue
     if quote:
-        if quote == "'" and text[i] == "\\" and i + 1 < len(text):
+        if quote == "'" and quote_escapes_backslash and text[i] == "\\" and i + 1 < len(text):
             visible.extend("  ")
             i += 2
         elif text.startswith(quote + quote, i):
             visible.extend("  ")
             i += len(quote) * 2
         elif text.startswith(quote, i):
-            visible.extend(" ")
+            visible.append(" ")
             i += len(quote)
             quote = None
+            quote_escapes_backslash = False
         else:
             visible.append("\n" if text[i] == "\n" else " ")
             i += 1
@@ -215,6 +238,13 @@ while i < len(text):
         continue
     if text[i] in ("'", '"'):
         quote = text[i]
+        if quote == "'":
+            prefix = text[i - 1] if i else ""
+            before_prefix = text[i - 2] if i >= 2 else ""
+            is_escape_string = prefix in "eE" and not (before_prefix.isalnum() or before_prefix == "_")
+            quote_escapes_backslash = is_escape_string or not standard_conforming_strings
+        else:
+            quote_escapes_backslash = False
         visible.append(" ")
         i += 1
         continue
@@ -270,10 +300,21 @@ CREATE TABLE app.escaped_literals (label text DEFAULT E'Synthetic \'Student\'');
 CREATE FUNCTION app.definition_literal_fn() RETURNS text LANGUAGE sql AS $$
   SELECT 'admin@example.invalid';
 $$;
-SELECT 'ordinary escaped literal: it\'s Synthetic Scholarship';
+SELECT 'ordinary doubled quote: it''s Synthetic Scholarship';
 -- INSERT INTO app.students VALUES ('Synthetic Student');
 /* outer comment /* nested INSERT INTO app.students VALUES ('Synthetic Student'); */
    still a comment with admin@example.invalid */
+EOF
+cat > "$data_scanner_test_dir/ordinary-backslash-before-close.sql" <<'EOF'
+SELECT 'ordinary backslash before close \';
+INSERT INTO app.students(display_name, fabricated_email)
+VALUES ('Synthetic Student', 'student@example.invalid');
+EOF
+cat > "$data_scanner_test_dir/ordinary-backslash-not-before-close.sql" <<'EOF'
+SELECT 'ordinary literal with backslash \ and text';
+EOF
+cat > "$data_scanner_test_dir/escape-string.sql" <<'EOF'
+SELECT E'escaped quote \' and escaped backslash \\';
 EOF
 cat > "$data_scanner_test_dir/dollar-quoted-literals.sql" <<'EOF'
 CREATE FUNCTION app.tagged_literal_fn() RETURNS text LANGUAGE sql AS $body$
@@ -291,6 +332,9 @@ Synthetic Student	student@example.invalid
 EOF
 : > "$data_scanner_test_dir/empty.sql"
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/definition-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/ordinary-backslash-before-close.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/ordinary-backslash-not-before-close.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/escape-string.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/dollar-quoted-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/insert-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/copy-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
@@ -412,7 +456,7 @@ This artifact contains sanitized results only. The database was synthetic and te
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
 | pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
-| Data-exclusion scanner fixtures | $data_scanner_tests_status | Definition, escaped-string, comment, and dollar-quoted literals PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
+| Data-exclusion scanner fixtures | $data_scanner_tests_status | PostgreSQL string/comment fixtures PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
 | pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Definition-aware output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |
