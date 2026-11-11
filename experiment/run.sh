@@ -249,7 +249,12 @@ while i < len(text):
         visible.append(" ")
         i += 1
         continue
-    dollar = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
+    # PostgreSQL dollar-quote openers must start at a token boundary. A
+    # preceding identifier character, including $, means the delimiter is
+    # part of an unquoted identifier rather than a string opener.
+    dollar = None
+    if text[i] == "$" and (i == 0 or text[i - 1] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$"):
+        dollar = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
     if dollar:
         tag = dollar.group(0)
         closing = text.find(tag, i + len(tag))
@@ -330,6 +335,12 @@ CREATE FUNCTION app.tagged_literal_fn() RETURNS text LANGUAGE sql AS $body$
   SELECT 'Synthetic Administrator', 'student@example.invalid';
 $body$;
 EOF
+cat > "$data_scanner_test_dir/dollar-quote-identifier-boundary.sql" <<'EOF'
+SELECT identifier$tag$fragment$tag$;
+INSERT INTO app.students(display_name, fabricated_email)
+VALUES ('Synthetic Student', 'student@example.invalid');
+SELECT $tag$valid dollar-quoted text$tag$;
+EOF
 cat > "$data_scanner_test_dir/insert-row-data.sql" <<'EOF'
 INSERT INTO app.students(display_name, fabricated_email)
 VALUES ('Synthetic Student', 'student@example.invalid');
@@ -359,6 +370,7 @@ if [[ "$(scan_data_exclusion "$data_scanner_test_dir/ordinary-backslash-before-c
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/ordinary-backslash-not-before-close.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/escape-string.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/dollar-quoted-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/dollar-quote-identifier-boundary.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/insert-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/copy-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/unterminated-single-quote.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
@@ -483,7 +495,7 @@ This artifact contains sanitized results only. The database was synthetic and te
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
 | pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
-| Data-exclusion scanner fixtures | $data_scanner_tests_status | Valid PostgreSQL string/comment fixtures PASS; INSERT/COPY row-data and unterminated-construct fixtures FAIL; empty fixture NOT TESTED |
+| Data-exclusion scanner fixtures | $data_scanner_tests_status | Valid PostgreSQL string/comment fixtures PASS; dollar-quote boundary, INSERT/COPY row-data and unterminated-construct fixtures FAIL; empty fixture NOT TESTED |
 | pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Definition-aware output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |
