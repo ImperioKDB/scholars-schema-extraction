@@ -188,6 +188,7 @@ line_comment = False
 block_depth = 0
 quote = None
 quote_escapes_backslash = False
+lexical_error = None
 while i < len(text):
     if line_comment:
         if text[i] == "\n":
@@ -254,6 +255,7 @@ while i < len(text):
         closing = text.find(tag, i + len(tag))
         if closing == -1:
             visible.extend(" " * (len(text) - i))
+            lexical_error = "unterminated dollar-quoted string"
             break
         segment = text[i:closing + len(tag)]
         visible.extend("\n" if c == "\n" else " " for c in segment)
@@ -261,6 +263,13 @@ while i < len(text):
         continue
     visible.append(text[i])
     i += 1
+
+if quote is not None:
+    lexical_error = lexical_error or f"unterminated {quote}-quoted construct"
+elif block_depth != 0:
+    lexical_error = lexical_error or "unterminated nested block comment"
+if lexical_error:
+    raise SystemExit(lexical_error)
 
 clean = "".join(visible)
 actual_data_statement = re.compile(r"(?im)^\s*(?:INSERT\s+INTO|COPY\s+[^\s(]+(?:\s*\([^)]*\))?\s*(?:FROM\s+stdin)?)(?:\s|;|$)")
@@ -330,6 +339,20 @@ COPY app.students (display_name, fabricated_email) FROM stdin;
 Synthetic Student	student@example.invalid
 \.
 EOF
+cat > "$data_scanner_test_dir/unterminated-single-quote.sql" <<'EOF'
+SELECT 'unterminated Synthetic Student
+EOF
+cat > "$data_scanner_test_dir/unterminated-double-identifier.sql" <<'EOF'
+SELECT "unterminated_identifier
+EOF
+cat > "$data_scanner_test_dir/unterminated-block-comment.sql" <<'EOF'
+/* outer comment /* nested comment
+INSERT INTO app.students VALUES ('Synthetic Student');
+EOF
+cat > "$data_scanner_test_dir/unterminated-dollar-quote.sql" <<'EOF'
+CREATE FUNCTION app.bad_body() RETURNS text LANGUAGE sql AS $body$
+  SELECT 'Synthetic Administrator';
+EOF
 : > "$data_scanner_test_dir/empty.sql"
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/definition-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/ordinary-backslash-before-close.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
@@ -338,6 +361,10 @@ if [[ "$(scan_data_exclusion "$data_scanner_test_dir/escape-string.sql")" != 'PA
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/dollar-quoted-literals.sql")" != 'PASS' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/insert-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/copy-row-data.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/unterminated-single-quote.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/unterminated-double-identifier.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/unterminated-block-comment.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
+if [[ "$(scan_data_exclusion "$data_scanner_test_dir/unterminated-dollar-quote.sql")" != 'FAIL' ]]; then data_scanner_tests_status='FAIL'; fi
 if [[ "$(scan_data_exclusion "$data_scanner_test_dir/empty.sql")" != 'NOT TESTED' ]]; then data_scanner_tests_status='FAIL'; fi
 
 pg_dump_output="$WORK_DIR/restricted-schema.sql"
@@ -456,7 +483,7 @@ This artifact contains sanitized results only. The database was synthetic and te
 | pg_dump schema-only extraction | $pg_dump_status | Exit: $pg_dump_exit; object statements: $pg_dump_object_count; stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
 | pg_dump expected objects | $pg_dump_objects_status | Missing definitions: $pg_dump_missing_objects |
 | pg_dump diagnostics are empty | $pg_dump_diagnostics_status | stdout: $pg_dump_stdout_diagnostic; stderr: $pg_dump_stderr_diagnostic |
-| Data-exclusion scanner fixtures | $data_scanner_tests_status | PostgreSQL string/comment fixtures PASS; INSERT/COPY row-data fixtures FAIL; empty fixture NOT TESTED |
+| Data-exclusion scanner fixtures | $data_scanner_tests_status | Valid PostgreSQL string/comment fixtures PASS; INSERT/COPY row-data and unterminated-construct fixtures FAIL; empty fixture NOT TESTED |
 | pg_dump contains no data statements or fabricated values | $pg_dump_data_statements | Definition-aware output scan |
 | pg-delta declarative generation | $pg_delta_status | Exit: $pg_delta_exit; files: $pg_delta_object_count; stdout: $pg_delta_stdout_diagnostic; stderr: $pg_delta_stderr_diagnostic |
 | pg-delta expected objects | $pg_delta_objects_status | Missing definitions: $pg_delta_missing_objects |
